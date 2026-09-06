@@ -498,7 +498,11 @@ func (l *Listener) startTun() (err error) {
 	}
 	l.tunIf = tunIf
 
-	err = l.startStack(stackOptions)
+	l.tunStack, err = tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
+	if err != nil {
+		return
+	}
+	err = l.tunStack.Start()
 	if err != nil {
 		return
 	}
@@ -536,15 +540,6 @@ func (l *Listener) startTun() (err error) {
 	l.addrStr = fmt.Sprintf("%s(%s,%s), mtu: %d, auto route: %v, auto redir: %v, ip stack: %s",
 		tunName, tunOptions.Inet4Address, tunOptions.Inet6Address, tunMTU, options.AutoRoute, options.AutoRedirect, options.Stack)
 	return
-}
-
-func (l *Listener) startStack(options tun.StackOptions) error {
-	var err error
-	l.tunStack, err = tun.NewStack(strings.ToLower(l.options.Stack.String()), options)
-	if err != nil {
-		return err
-	}
-	return l.tunStack.Start()
 }
 
 func (l *Listener) ruleUpdateCallback(ruleProvider P.RuleProvider) {

@@ -1,4 +1,4 @@
-//go:build windows && with_gvisor && (amd64 || 386)
+//go:build windows && (amd64 || 386)
 
 package windivert
 
@@ -10,17 +10,17 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
-	"github.com/metacubex/gvisor/pkg/buffer"
-	"github.com/metacubex/gvisor/pkg/tcpip/header"
-	"github.com/metacubex/gvisor/pkg/tcpip/link/channel"
-	"github.com/metacubex/gvisor/pkg/tcpip/stack"
 	"github.com/metacubex/mihomo/log"
 	tun "github.com/metacubex/sing-tun"
 	"golang.org/x/exp/slices"
 )
 
 type Options struct {
+	Stack            string
+	Handler          tun.Handler
+	UDPTimeout       time.Duration
 	MTU              uint32
 	IPv6             bool
 	HijackDNS        func(netip.AddrPort) bool
@@ -34,7 +34,11 @@ type Options struct {
 
 type Tun struct {
 	handle      *handle
-	endpoint    *channel.Endpoint
+	ctx         context.Context
+	cancel      context.CancelFunc
+	tcp         *tcpRedirect
+	deliver     func([]byte, packetInfo)
+	closeStack  func()
 	options     Options
 	pid         uint32
 	includeIf   map[uint32]bool
@@ -46,7 +50,7 @@ type Tun struct {
 	running     sync.WaitGroup
 }
 
-var _ tun.GVisorTun = (*Tun)(nil)
+var _ tun.Tun = (*Tun)(nil)
 
 var active atomic.Bool
 
@@ -54,16 +58,17 @@ func New(options Options) (_ *Tun, err error) {
 	if !active.CompareAndSwap(false, true) {
 		return nil, fmt.Errorf("only one WFP listener can be active")
 	}
-	defer func() {
-		if err != nil {
-			active.Store(false)
-		}
-	}()
 	t := &Tun{
 		options: options, pid: uint32(os.Getpid()),
 		tcpFlows: make(map[flow]uint32), interfaces: make(map[netip.Addr]address),
 		includeIf: make(map[uint32]bool), excludeIf: make(map[uint32]bool),
 	}
+	t.ctx, t.cancel = context.WithCancel(context.Background())
+	defer func() {
+		if err != nil {
+			t.Close()
+		}
+	}()
 	for _, entry := range []struct {
 		names   []string
 		indexes map[uint32]bool
@@ -82,25 +87,31 @@ func New(options Options) (_ *Tun, err error) {
 	if err != nil {
 		return nil, err
 	}
-	t.endpoint = channel.New(256, options.MTU, "")
-	// Captured packets may still contain hardware-offloaded checksums.
-	t.endpoint.LinkEPCapabilities = stack.CapabilityRXChecksumOffload
+	switch options.Stack {
+	case "system":
+		t.deliver = t.deliverUDP
+	case "gvisor", "mixed":
+		if err = t.startGVisor(); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unknown WFP stack: %s", options.Stack)
+	}
+	if options.Stack != "gvisor" {
+		if err = t.startTCP(); err != nil {
+			return nil, err
+		}
+	}
 	return t, nil
 }
 
-// Start is called only after the protocol stack is ready to consume packets.
 func (t *Tun) Start() error {
 	if err := t.handle.start(); err != nil {
 		return err
 	}
-	t.running.Add(2)
+	t.running.Add(1)
 	go t.readLoop()
-	go t.writeLoop()
 	return nil
-}
-
-func (t *Tun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error) {
-	return t.endpoint, stack.NICOptions{}, nil
 }
 
 func (t *Tun) Read([]byte) (int, error) { return 0, os.ErrInvalid }
@@ -122,12 +133,6 @@ func (t *Tun) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("WFP response interface not found for %s", destination)
 	}
 	return t.handle.send(p, &addr)
-}
-
-func (t *Tun) WritePacket(pkt *stack.PacketBuffer) (int, error) {
-	view := pkt.ToView()
-	defer view.Release()
-	return t.Write(view.AsSlice())
 }
 
 func (t *Tun) selected(info packetInfo, addr address) bool {
@@ -199,6 +204,16 @@ func (t *Tun) readLoop() {
 			return
 		}
 		info, ok := parsePacket(p[:n])
+		if ok && t.tcp != nil && info.protocol == 6 && info.source.Port() == t.tcp.port(info.source.Addr()) {
+			if t.tcp.reply(p[:n], info) {
+				if _, err = t.Write(p[:n]); err != nil {
+					t.close(fmt.Errorf("TCP reply: %w", err))
+					return
+				}
+			}
+			// Expired or unsolicited relay connections must not escape to the network.
+			continue
+		}
 		if !ok || !t.selected(info, addr) || !t.capture(info) {
 			if _, err = t.handle.send(p[:n], &addr); err != nil {
 				t.close(fmt.Errorf("bypass: %w", err))
@@ -210,30 +225,14 @@ func (t *Tun) readLoop() {
 		// Replies are inbound on this interface; zero checksum flags request recalculation.
 		t.interfaces[info.source.Addr()] = address{IfIdx: addr.IfIdx, SubIfIdx: addr.SubIfIdx}
 		t.interfaceMu.Unlock()
-		protocol := header.IPv4ProtocolNumber
-		if info.source.Addr().Is6() {
-			protocol = header.IPv6ProtocolNumber
-		}
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(append([]byte(nil), p[:n]...)), IsForwardedPacket: true,
-		})
-		t.endpoint.InjectInbound(protocol, pkt)
-		pkt.DecRef()
-	}
-}
-
-func (t *Tun) writeLoop() {
-	defer t.running.Done()
-	for {
-		pkt := t.endpoint.ReadContext(context.Background())
-		if pkt == nil {
-			return
-		}
-		_, err := t.WritePacket(pkt)
-		pkt.DecRef()
-		if err != nil {
-			t.close(fmt.Errorf("send: %w", err))
-			return
+		if info.protocol == 6 && t.tcp != nil {
+			t.tcp.redirect(p[:n], info)
+			if _, err = t.Write(p[:n]); err != nil {
+				t.close(fmt.Errorf("TCP redirect: %w", err))
+				return
+			}
+		} else {
+			t.deliver(p[:n], info)
 		}
 	}
 }
@@ -243,8 +242,16 @@ func (t *Tun) close(err error) {
 		if err != nil {
 			log.Errorln("[WFP] %s", err)
 		}
-		t.handle.close()
-		t.endpoint.Close()
+		t.cancel()
+		if t.tcp != nil {
+			t.tcp.close()
+		}
+		if t.handle != nil {
+			t.handle.close()
+		}
+		if t.closeStack != nil {
+			t.closeStack()
+		}
 		active.Store(false)
 	})
 }

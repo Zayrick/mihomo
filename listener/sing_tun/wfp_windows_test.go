@@ -1,4 +1,4 @@
-//go:build windows && with_gvisor && (amd64 || 386)
+//go:build windows && (amd64 || 386)
 
 package sing_tun
 
@@ -10,12 +10,17 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/component/fakeip"
 	"github.com/metacubex/mihomo/component/nat"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	MDNS "github.com/metacubex/mihomo/dns"
 	LC "github.com/metacubex/mihomo/listener/config"
+	tun "github.com/metacubex/sing-tun"
 )
 
 type wfpEchoTunnel struct {
@@ -39,56 +44,101 @@ func TestWFPIntegration(t *testing.T) {
 	if os.Getenv("MIHOMO_WFP_TEST") != "1" {
 		t.Skip("set MIHOMO_WFP_TEST=1 as administrator to load the embedded driver")
 	}
+	pool, err := fakeip.New(fakeip.Options{IPNet: netip.MustParsePrefix("198.18.0.1/16"), Size: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := resolver.DefaultService
+	resolver.DefaultService = MDNS.NewService(MDNS.NewResolver(MDNS.Config{}), MDNS.NewEnhancer(MDNS.EnhancerConfig{
+		EnhancedMode: C.DNSFakeIP, FakeIPPool: pool, FakeIPSkipper: &fakeip.Skipper{}, FakeIPTTL: 1,
+	}))
+	defer func() { resolver.DefaultService = previous }()
+	client := wfpTestClient(t)
+	stacks := []C.TUNStack{C.TunSystem}
+	if tun.WithGVisor {
+		stacks = append(stacks, C.TunMixed, C.TunGvisor)
+	}
+	for _, stack := range stacks {
+		t.Run(stack.String(), func(t *testing.T) { testWFPStack(t, stack, client) })
+	}
+}
+
+// A separate executable prevents the relay's firewall rule from also allowing the client.
+func wfpTestClient(t *testing.T) string {
+	t.Helper()
+	input, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "wfp-client.exe")
+	if err := os.WriteFile(path, input, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func testWFPStack(t *testing.T, stack C.TUNStack, client string) {
 	echo := &wfpEchoTunnel{table: nat.New(), seen: make(chan *C.Metadata, 8)}
-	options := LC.Tun{Driver: "wfp", Stack: C.TunGvisor, RouteAddress: []netip.Prefix{netip.MustParsePrefix("198.18.0.1/32")}}
+	options := LC.Tun{Driver: "wfp", Stack: stack, RouteAddress: []netip.Prefix{netip.MustParsePrefix("198.18.0.1/32")}}
 	networks := []string{"tcp4", "udp4"}
 	if os.Getenv("MIHOMO_WFP_TEST_IPV6") == "1" {
 		options.Inet6Address = []netip.Prefix{netip.MustParsePrefix("fdfe::1/126")}
 		options.RouteAddress = append(options.RouteAddress, netip.MustParsePrefix("2001:db8::1/128"))
 		networks = append(networks, "tcp6", "udp6")
 	}
-	l, err := New(options, echo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	for _, network := range networks {
-		t.Run(network, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWFPClient$")
-			child.Env = append(os.Environ(), "MIHOMO_WFP_CLIENT="+network)
-			if output, err := child.CombinedOutput(); err != nil {
-				t.Fatalf("child: %v\n%s", err, output)
-			}
-			select {
-			case metadata := <-echo.seen:
-				destination := "198.18.0.1"
-				if network[len(network)-1] == '6' {
-					destination = "2001:db8::1"
+	t.Run("traffic", func(t *testing.T) {
+		l, err := New(options, echo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		for _, network := range networks {
+			t.Run(network, func(t *testing.T) {
+				runWFPClient(t, client, "TestWFPClient", network)
+				select {
+				case metadata := <-echo.seen:
+					destination := "198.18.0.1"
+					if network[len(network)-1] == '6' {
+						destination = "2001:db8::1"
+					}
+					if metadata.DstIP.String() != destination || metadata.DstPort != 18473 {
+						t.Fatalf("original destination lost: %+v", metadata)
+					}
+				default:
+					t.Fatal("packet did not reach mihomo tunnel")
 				}
-				if metadata.DstIP.String() != destination || metadata.DstPort != 18473 {
-					t.Fatalf("original destination lost: %+v", metadata)
-				}
-			case <-ctx.Done():
-				t.Fatal("packet did not reach mihomo tunnel")
-			}
-		})
-	}
-	conn, err := net.DialTimeout("tcp4", "198.18.0.1:18473", 500*time.Millisecond)
-	if err == nil {
-		conn.Close()
-		t.Fatal("the listener's own connection was intercepted")
-	}
-	if err := l.Close(); err != nil {
-		t.Fatal(err)
-	}
-	l, err = New(options, echo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Close(); err != nil {
-		t.Fatal(err)
+			})
+		}
+		conn, err := net.DialTimeout("tcp4", "198.18.0.1:18473", 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			t.Fatal("the listener's own connection was intercepted")
+		}
+	})
+	t.Run("dns", func(t *testing.T) {
+		options.DNSHijack = []string{"any:53"}
+		options.Inet6Address = nil
+		l, err := New(options, echo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		for _, network := range networks {
+			t.Run(network, func(t *testing.T) {
+				runWFPClient(t, client, "TestWFPDNSClient", network)
+			})
+		}
+	})
+}
+
+func runWFPClient(t *testing.T, client, test, network string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	child := exec.CommandContext(ctx, client, "-test.run=^"+test+"$")
+	child.Env = append(os.Environ(), "MIHOMO_WFP_CLIENT="+network)
+	if output, err := child.CombinedOutput(); err != nil {
+		t.Fatalf("%s: %v\n%s", test, err, output)
 	}
 }
 

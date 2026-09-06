@@ -14,6 +14,8 @@ type flow struct {
 type packetInfo struct {
 	flow
 	tcpFlags byte
+	offset   int
+	size     int
 }
 
 // Non-TCP/UDP packets and fragments are left to the Windows network stack.
@@ -70,5 +72,20 @@ func parsePacket(p []byte) (info packetInfo, ok bool) {
 	}
 	info.source = netip.AddrPortFrom(src, binary.BigEndian.Uint16(p[offset:]))
 	info.destination = netip.AddrPortFrom(dst, binary.BigEndian.Uint16(p[offset+2:]))
+	info.offset, info.size = offset, size
 	return info, true
+}
+
+func rewriteTCP(p []byte, info packetInfo, source, destination netip.AddrPort) {
+	if source.Addr().Is4() {
+		copy(p[12:16], source.Addr().AsSlice())
+		copy(p[16:20], destination.Addr().AsSlice())
+		binary.BigEndian.PutUint16(p[10:], 0)
+	} else {
+		copy(p[8:24], source.Addr().AsSlice())
+		copy(p[24:40], destination.Addr().AsSlice())
+	}
+	binary.BigEndian.PutUint16(p[info.offset:], source.Port())
+	binary.BigEndian.PutUint16(p[info.offset+2:], destination.Port())
+	binary.BigEndian.PutUint16(p[info.offset+16:], 0)
 }

@@ -1,6 +1,10 @@
 # Windows WFP
 
-`driver: wfp` 通过 WinDivert 2.2 接管本机其他进程的出站 TCP/UDP，使用 mihomo 的规则、代理和 DNS 处理。支持 Windows x86/x64，需管理员权限和 `stack: gvisor`。
+`driver: wfp` 通过 WinDivert 2.2 接管本机其他进程的出站 TCP/UDP，使用 mihomo 的规则、代理和 DNS 处理。支持 Windows x86/x64，需管理员权限。
+
+`stack: system` 使用 Windows TCP 协议栈并直接处理 UDP；`mixed` 使用 Windows TCP 协议栈和 gVisor UDP；`gvisor` 使用 gVisor 处理 TCP/UDP。
+
+`system` 和 `mixed` 会为当前程序添加 TCP 入站防火墙规则，关闭监听器时移除。
 
 ```yaml
 dns:
@@ -15,7 +19,7 @@ tun:
     - any:53
 ```
 
-构建时使用项目默认的 `with_gvisor` 标签：
+`mixed` 和 `gvisor` 构建时需要 `with_gvisor` 标签：
 
 ```powershell
 go build -tags with_gvisor -o mihomo.exe .
@@ -31,11 +35,11 @@ WFP 使用 `mtu`（默认 1500）、`dns-hijack`、`udp-timeout`、`route-addres
 
 驱动和许可证位于 `component/windivert/driver`。嵌入的驱动会自动释放到运行账户 Local AppData 下的 `mihomo\windivert\2.2.2` 并加载。
 
-管理员可运行驱动集成测试，验证 TCP/UDP 往返、DNS 劫持、目标地址、自身连接绕过及关闭重开：
+管理员可运行三种协议栈的驱动集成测试：
 
 ```powershell
 $env:MIHOMO_WFP_TEST = '1'
 # 本机有 IPv6 出口时，可同时验证 2001:db8::1/128：
 # $env:MIHOMO_WFP_TEST_IPV6 = '1'
-go test -tags with_gvisor ./listener/sing_tun -run '^TestWFP(Integration|DNSIntegration)$' -v -count=1 -timeout=90s
+go test -tags with_gvisor ./listener/sing_tun -run '^TestWFPIntegration$' -v -count=1 -timeout=90s
 ```
