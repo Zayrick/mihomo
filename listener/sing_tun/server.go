@@ -133,15 +133,51 @@ func checkTunName(tunName string) (ok bool) {
 	return true
 }
 
-func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Listener, err error) {
+func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (*Listener, error) {
+	if options.Driver != "" && options.Driver != "wfp" {
+		return nil, fmt.Errorf("unknown tun driver: %s", options.Driver)
+	}
 	if len(additions) == 0 {
 		additions = []inbound.Addition{
 			inbound.WithInName("DEFAULT-TUN"),
 			inbound.WithSpecialRules(""),
 		}
 	}
+	var dnsAdds []netip.AddrPort
+	for _, d := range options.DNSHijack {
+		if _, after, ok := strings.Cut(d, "://"); ok {
+			d = after
+		}
+		addrPort, err := netip.ParseAddrPort(strings.Replace(d, "any", "0.0.0.0", 1))
+		if err != nil {
+			return nil, fmt.Errorf("parse dns-hijack url error: %w", err)
+		}
+		dnsAdds = append(dnsAdds, addrPort)
+	}
+	h, err := sing.NewListenerHandler(sing.ListenerConfig{
+		Tunnel: tunnel, Type: C.TUN, Additions: additions,
+	})
+	if err != nil {
+		return nil, err
+	}
+	l := &Listener{options: options, handler: &ListenerHandler{ListenerHandler: h, DnsAddrPorts: dnsAdds}}
+	if options.Driver == "wfp" {
+		err = l.startWFP()
+	} else {
+		err = l.startTun()
+	}
+	if err != nil {
+		l.Close()
+		return nil, err
+	}
+	return l, nil
+}
+
+func (l *Listener) startTun() (err error) {
+	options := l.options
+	handler := l.handler
 	ctx := context.TODO()
-	rpTunnel := tunnel.(P.Tunnel)
+	rpTunnel := handler.Tunnel.(P.Tunnel)
 	if options.GSOMaxSize == 0 {
 		options.GSOMaxSize = 65536
 	}
@@ -230,7 +266,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		var err error
 		includeUID, err = parseRange(includeUID, options.IncludeUIDRange)
 		if err != nil {
-			return nil, E.Cause(err, "parse include_uid_range")
+			return E.Cause(err, "parse include_uid_range")
 		}
 	}
 	excludeUID := uidToRange(options.ExcludeUID)
@@ -238,7 +274,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		var err error
 		excludeUID, err = parseRange(excludeUID, options.ExcludeUIDRange)
 		if err != nil {
-			return nil, E.Cause(err, "parse exclude_uid_range")
+			return E.Cause(err, "parse exclude_uid_range")
 		}
 	}
 	excludeSrcPort := uidToRange(options.ExcludeSrcPort)
@@ -246,7 +282,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		var err error
 		excludeSrcPort, err = parseRange(excludeSrcPort, options.ExcludeSrcPortRange)
 		if err != nil {
-			return nil, E.Cause(err, "parse exclude_src_port_range")
+			return E.Cause(err, "parse exclude_src_port_range")
 		}
 	}
 	excludeDstPort := uidToRange(options.ExcludeDstPort)
@@ -254,14 +290,14 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		var err error
 		excludeDstPort, err = parseRange(excludeDstPort, options.ExcludeDstPortRange)
 		if err != nil {
-			return nil, E.Cause(err, "parse exclude_dst_port_range")
+			return E.Cause(err, "parse exclude_dst_port_range")
 		}
 	}
 	var includeMACAddress []net.HardwareAddr
 	for _, mac := range options.IncludeMACAddress {
 		addr, err := net.ParseMAC(mac)
 		if err != nil {
-			return nil, E.Cause(err, "parse include_mac_address")
+			return E.Cause(err, "parse include_mac_address")
 		}
 		includeMACAddress = append(includeMACAddress, addr)
 	}
@@ -269,66 +305,28 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	for _, mac := range options.ExcludeMACAddress {
 		addr, err := net.ParseMAC(mac)
 		if err != nil {
-			return nil, E.Cause(err, "parse exclude_mac_address")
+			return E.Cause(err, "parse exclude_mac_address")
 		}
 		excludeMACAddress = append(excludeMACAddress, addr)
-	}
-
-	var dnsAdds []netip.AddrPort
-
-	for _, d := range options.DNSHijack {
-		if _, after, ok := strings.Cut(d, "://"); ok {
-			d = after
-		}
-		d = strings.Replace(d, "any", "0.0.0.0", 1)
-		addrPort, err := netip.ParseAddrPort(d)
-		if err != nil {
-			return nil, fmt.Errorf("parse dns-hijack url error: %w", err)
-		}
-
-		dnsAdds = append(dnsAdds, addrPort)
 	}
 
 	var dnsServerIp []string
 	for _, a := range options.Inet4Address {
 		addrPort := netip.AddrPortFrom(a.Addr().Next(), 53)
 		dnsServerIp = append(dnsServerIp, a.Addr().Next().String())
-		dnsAdds = append(dnsAdds, addrPort)
+		handler.DnsAddrPorts = append(handler.DnsAddrPorts, addrPort)
 	}
 	for _, a := range options.Inet6Address {
 		addrPort := netip.AddrPortFrom(a.Addr().Next(), 53)
 		dnsServerIp = append(dnsServerIp, a.Addr().Next().String())
-		dnsAdds = append(dnsAdds, addrPort)
+		handler.DnsAddrPorts = append(handler.DnsAddrPorts, addrPort)
 	}
 
-	h, err := sing.NewListenerHandler(sing.ListenerConfig{
-		Tunnel:    tunnel,
-		Type:      C.TUN,
-		Additions: additions,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	handler := &ListenerHandler{
-		ListenerHandler:       h,
-		DnsAddrPorts:          dnsAdds,
-		Inet4Address:          options.Inet4Address,
-		Inet6Address:          options.Inet6Address,
-		DisableICMPForwarding: options.DisableICMPForwarding,
-	}
-	l = &Listener{
-		closed:  false,
-		options: options,
-		handler: handler,
-		tunName: tunName,
-	}
-	defer func() {
-		if err != nil {
-			l.Close()
-			l = nil
-		}
-	}()
+	handler.Inet4Address = options.Inet4Address
+	handler.Inet6Address = options.Inet6Address
+	handler.DisableICMPForwarding = options.DisableICMPForwarding
+	l.options = options
+	l.tunName = tunName
 
 	interfaceFinder := DefaultInterfaceFinder
 
@@ -425,7 +423,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		l.routeExcludeAddressMap = make(map[string]*netipx.IPSet)
 
 		if !options.AutoRoute {
-			return nil, E.New("`auto-route` is required by `auto-redirect`")
+			return E.New("`auto-route` is required by `auto-redirect`")
 		}
 		disableNFTables, dErr := strconv.ParseBool(os.Getenv("DISABLE_NFTABLES"))
 		l.autoRedirect, err = tun.NewAutoRedirect(tun.AutoRedirectOptions{
@@ -500,16 +498,10 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	}
 	l.tunIf = tunIf
 
-	tunStack, err := tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
+	err = l.startStack(stackOptions)
 	if err != nil {
 		return
 	}
-
-	err = tunStack.Start()
-	if err != nil {
-		return
-	}
-	l.tunStack = tunStack
 
 	if l.autoRedirect != nil {
 		if len(l.options.RouteAddressSet) > 0 && len(l.routeAddressSet) == 0 {
@@ -544,6 +536,15 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	l.addrStr = fmt.Sprintf("%s(%s,%s), mtu: %d, auto route: %v, auto redir: %v, ip stack: %s",
 		tunName, tunOptions.Inet4Address, tunOptions.Inet6Address, tunMTU, options.AutoRoute, options.AutoRedirect, options.Stack)
 	return
+}
+
+func (l *Listener) startStack(options tun.StackOptions) error {
+	var err error
+	l.tunStack, err = tun.NewStack(strings.ToLower(l.options.Stack.String()), options)
+	if err != nil {
+		return err
+	}
+	return l.tunStack.Start()
 }
 
 func (l *Listener) ruleUpdateCallback(ruleProvider P.RuleProvider) {
