@@ -3,14 +3,13 @@
 package windivert
 
 import (
-	"fmt"
-
 	"github.com/metacubex/gvisor/pkg/buffer"
 	"github.com/metacubex/gvisor/pkg/tcpip/header"
 	"github.com/metacubex/gvisor/pkg/tcpip/link/channel"
 	"github.com/metacubex/gvisor/pkg/tcpip/stack"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/udp"
+	"github.com/metacubex/mihomo/log"
 	tun "github.com/metacubex/sing-tun"
 )
 
@@ -59,8 +58,7 @@ func (t *Tun) startGVisor() error {
 			view.Release()
 			pkt.DecRef()
 			if err != nil {
-				t.close(fmt.Errorf("send: %w", err))
-				return
+				log.Warnln("[WFP] send: packet dropped: %s", err)
 			}
 		}
 	}()

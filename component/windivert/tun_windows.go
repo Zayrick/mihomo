@@ -207,8 +207,7 @@ func (t *Tun) readLoop() {
 		if ok && t.tcp != nil && info.protocol == 6 && info.source.Port() == t.tcp.port(info.source.Addr()) {
 			if t.tcp.reply(p[:n], info) {
 				if _, err = t.Write(p[:n]); err != nil {
-					t.close(fmt.Errorf("TCP reply: %w", err))
-					return
+					log.Warnln("[WFP] TCP reply: packet dropped: %s", err)
 				}
 			}
 			// Expired or unsolicited relay connections must not escape to the network.
@@ -216,8 +215,7 @@ func (t *Tun) readLoop() {
 		}
 		if !ok || !t.selected(info, addr) || !t.capture(info) {
 			if _, err = t.handle.send(p[:n], &addr); err != nil {
-				t.close(fmt.Errorf("bypass: %w", err))
-				return
+				log.Warnln("[WFP] bypass: packet dropped: %s", err)
 			}
 			continue
 		}
@@ -228,8 +226,7 @@ func (t *Tun) readLoop() {
 		if info.protocol == 6 && t.tcp != nil {
 			t.tcp.redirect(p[:n], info)
 			if _, err = t.Write(p[:n]); err != nil {
-				t.close(fmt.Errorf("TCP redirect: %w", err))
-				return
+				log.Warnln("[WFP] TCP redirect: packet dropped: %s", err)
 			}
 		} else {
 			t.deliver(p[:n], info)
