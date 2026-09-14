@@ -18,6 +18,7 @@ func TestAddressLayout(t *testing.T) {
 }
 
 func TestSocketOwner(t *testing.T) {
+	device := new(Tun)
 	for _, network := range []string{"udp4", "udp6"} {
 		conn, err := net.ListenPacket(network, ":0")
 		if err != nil {
@@ -30,7 +31,7 @@ func TestSocketOwner(t *testing.T) {
 			ip = netip.IPv6Loopback()
 		}
 		key := flow{source: netip.AddrPortFrom(ip, addr.Port()), protocol: 17}
-		owners, err := socketTable(key)
+		owners, err := device.socketTable(key)
 		if err != nil || owners[key] != uint32(os.Getpid()) {
 			t.Fatalf("%s owner=%d err=%v", network, owners[key], err)
 		}

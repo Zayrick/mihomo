@@ -19,7 +19,6 @@ const (
 	ioctlStartup    = 0x12e489
 	ioctlRecv       = 0x12648e
 	ioctlSend       = 0x12e491
-	ioctlShutdown   = 0x12e49d
 	accept          = 0x7ffe
 	reject          = 0x7fff
 )
@@ -53,9 +52,18 @@ var networkFilter = []instruction{
 }
 
 type handle struct {
-	mu     sync.RWMutex
-	value  windows.Handle
-	closed bool
+	mu      sync.Mutex
+	value   windows.Handle
+	closed  bool
+	receive ioOperation
+	sendIO  ioOperation
+}
+
+type ioOperation struct {
+	mu      sync.Mutex
+	overlap windows.Overlapped
+	args    [16]byte
+	data    []byte
 }
 
 func openHandle() (*handle, error) {
@@ -75,6 +83,13 @@ func openHandle() (*handle, error) {
 		return nil, fmt.Errorf("open WinDivert: %w", err)
 	}
 	h := &handle{value: v}
+	for _, operation := range []*ioOperation{&h.receive, &h.sendIO} {
+		operation.overlap.HEvent, err = windows.CreateEvent(nil, 1, 0, nil)
+		if err != nil {
+			h.close()
+			return nil, fmt.Errorf("create WinDivert I/O event: %w", err)
+		}
+	}
 	var args [16]byte
 	binary.LittleEndian.PutUint32(args[4:], 30000) // priority zero, biased by PRIORITY_MAX
 	var version [64]byte
@@ -112,26 +127,32 @@ func (h *handle) start() error {
 }
 
 func (h *handle) ioctl(code uint32, args *[16]byte, data []byte) (uint32, error) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	operation := &h.sendIO
+	if code == ioctlRecv {
+		operation = &h.receive
+	}
+	operation.mu.Lock()
+	defer operation.mu.Unlock()
+	h.mu.Lock()
 	if h.closed {
+		h.mu.Unlock()
 		return 0, windows.ERROR_OPERATION_ABORTED
 	}
-	event, err := windows.CreateEvent(nil, 0, 0, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer windows.CloseHandle(event)
-	overlap := &windows.Overlapped{HEvent: event}
+	overlap := &operation.overlap
+	*overlap = windows.Overlapped{HEvent: overlap.HEvent}
+	// Keep the buffers on the heap until overlapped I/O completes.
+	operation.args, operation.data = *args, data
 	var n uint32
 	var p *byte
 	if len(data) > 0 {
 		p = &data[0]
 	}
-	err = windows.DeviceIoControl(h.value, code, &args[0], 16, p, uint32(len(data)), &n, overlap)
+	err := windows.DeviceIoControl(h.value, code, &operation.args[0], 16, p, uint32(len(data)), &n, overlap)
+	h.mu.Unlock()
 	if errors.Is(err, windows.ERROR_IO_PENDING) {
 		err = windows.GetOverlappedResult(h.value, overlap, &n, true)
 	}
+	operation.data = nil
 	return n, err
 }
 
@@ -156,16 +177,25 @@ func (h *handle) packetIO(code uint32, packet []byte, addr uintptr) (int, error)
 	return int(n), err
 }
 
-func (h *handle) close() error {
-	// Shutdown releases a pending receive before taking the exclusive lock.
-	var args [16]byte
-	binary.LittleEndian.PutUint32(args[:], 3)
-	h.ioctl(ioctlShutdown, &args, nil)
+func (h *handle) close() {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed {
-		return nil
+		h.mu.Unlock()
+		return
 	}
 	h.closed = true
-	return windows.CloseHandle(h.value)
+	windows.CancelIoEx(h.value, nil)
+	h.mu.Unlock()
+	operations := []*ioOperation{&h.receive, &h.sendIO}
+	// Each operation holds its lock through completion, including cancellation.
+	for _, operation := range operations {
+		operation.mu.Lock()
+		defer operation.mu.Unlock()
+	}
+	windows.CloseHandle(h.value)
+	for _, operation := range operations {
+		if operation.overlap.HEvent != 0 {
+			windows.CloseHandle(operation.overlap.HEvent)
+		}
+	}
 }

@@ -11,19 +11,22 @@ import (
 	N "github.com/metacubex/sing/common/network"
 )
 
-func (t *Tun) deliverUDP(p []byte, info packetInfo) {
+func (t *Tun) deliverUDP(p []byte, info packetInfo, addr address) {
 	length := int(binary.BigEndian.Uint16(p[info.offset+4:]))
 	if length < 8 || info.offset+length > info.size {
 		return
 	}
 	metadata := M.Metadata{Source: M.SocksaddrFromNetIP(info.source), Destination: M.SocksaddrFromNetIP(info.destination)}
 	t.options.Handler.NewPacket(t.ctx, info.source, buf.As(p[info.offset+8:info.offset+length]).ToOwned(), metadata,
-		func(N.PacketConn) N.PacketWriter { return &udpWriter{tun: t, destination: info.source} })
+		func(N.PacketConn) N.PacketWriter {
+			return &udpWriter{handle: t.handle, destination: info.source, addr: addr}
+		})
 }
 
 type udpWriter struct {
-	tun         *Tun
+	handle      *handle
 	destination netip.AddrPort
+	addr        address
 }
 
 func (w *udpWriter) WritePacket(buffer *buf.Buffer, source M.Socksaddr) error {
@@ -48,6 +51,6 @@ func (w *udpWriter) WritePacket(buffer *buf.Buffer, source M.Socksaddr) error {
 	binary.BigEndian.PutUint16(p[headerLen+2:], w.destination.Port())
 	binary.BigEndian.PutUint16(p[headerLen+4:], uint16(8+buffer.Len()))
 	copy(p[headerLen+8:], buffer.Bytes())
-	_, err := w.tun.Write(p)
+	_, err := w.handle.send(p, &w.addr)
 	return err
 }

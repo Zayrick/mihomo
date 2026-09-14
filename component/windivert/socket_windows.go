@@ -16,8 +16,7 @@ var (
 	udpTable = ipHelper.NewProc("GetExtendedUdpTable")
 )
 
-// TCP snapshots also reclaim captured flows; UDP only needs the current socket.
-func socketTable(key flow) (map[flow]uint32, error) {
+func (t *Tun) socketTable(key flow) (map[flow]uint32, error) {
 	ipv6, tcp := key.source.Addr().Is6(), key.protocol == 6
 	family := uintptr(windows.AF_INET)
 	if ipv6 {
@@ -27,17 +26,22 @@ func socketTable(key flow) (map[flow]uint32, error) {
 	if tcp {
 		proc, class = tcpTable, 5 // TCP_TABLE_OWNER_PID_ALL, includes SYN_SENT
 	}
-	size := uint32(4096)
+	size := uint32(len(t.socketBuffer))
+	if size < 4096 {
+		size = 4096
+	}
 	for {
-		data := make([]byte, size)
-		code, _, _ := proc.Call(uintptr(unsafe.Pointer(&data[0])), uintptr(unsafe.Pointer(&size)), 0, family, class, 0)
+		if uint32(len(t.socketBuffer)) < size {
+			t.socketBuffer = make([]byte, size)
+		}
+		code, _, _ := proc.Call(uintptr(unsafe.Pointer(&t.socketBuffer[0])), uintptr(unsafe.Pointer(&size)), 0, family, class, 0)
 		if code == uintptr(windows.ERROR_INSUFFICIENT_BUFFER) {
 			continue
 		}
 		if code != 0 {
 			return nil, windows.Errno(code)
 		}
-		return parseSocketTable(data, key), nil
+		return parseSocketTable(t.socketBuffer[:size], key), nil
 	}
 }
 

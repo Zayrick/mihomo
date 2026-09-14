@@ -46,7 +46,7 @@ type Listener struct {
 	tunName string
 	addrStr string
 
-	tunIf    tun.Tun
+	tunIf    io.Closer
 	tunStack tun.Stack
 
 	networkUpdateMonitor    tun.NetworkUpdateMonitor

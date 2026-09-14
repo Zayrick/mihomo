@@ -33,24 +33,21 @@ type Options struct {
 }
 
 type Tun struct {
-	handle      *handle
-	ctx         context.Context
-	cancel      context.CancelFunc
-	tcp         *tcpRedirect
-	deliver     func([]byte, packetInfo)
-	closeStack  func()
-	options     Options
-	pid         uint32
-	includeIf   map[uint32]bool
-	excludeIf   map[uint32]bool
-	interfaceMu sync.Mutex
-	tcpFlows    map[flow]uint32
-	interfaces  map[netip.Addr]address
-	closeOnce   sync.Once
-	running     sync.WaitGroup
+	handle       *handle
+	ctx          context.Context
+	cancel       context.CancelFunc
+	tcp          *tcpRedirect
+	deliver      func([]byte, packetInfo, address)
+	closeStack   func()
+	options      Options
+	pid          uint32
+	includeIf    map[uint32]bool
+	excludeIf    map[uint32]bool
+	tcpFlows     map[flow]uint32
+	socketBuffer []byte
+	closeOnce    sync.Once
+	running      sync.WaitGroup
 }
-
-var _ tun.Tun = (*Tun)(nil)
 
 var active atomic.Bool
 
@@ -60,7 +57,7 @@ func New(options Options) (_ *Tun, err error) {
 	}
 	t := &Tun{
 		options: options, pid: uint32(os.Getpid()),
-		tcpFlows: make(map[flow]uint32), interfaces: make(map[netip.Addr]address),
+		tcpFlows:  make(map[flow]uint32),
 		includeIf: make(map[uint32]bool), excludeIf: make(map[uint32]bool),
 	}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
@@ -114,27 +111,6 @@ func (t *Tun) Start() error {
 	return nil
 }
 
-func (t *Tun) Read([]byte) (int, error) { return 0, os.ErrInvalid }
-
-func (t *Tun) Write(p []byte) (int, error) {
-	// Responses can include ICMP errors or IP fragments emitted by the stack.
-	var destination netip.Addr
-	if len(p) >= 20 && p[0]>>4 == 4 {
-		destination, _ = netip.AddrFromSlice(p[16:20])
-	} else if len(p) >= 40 && p[0]>>4 == 6 {
-		destination, _ = netip.AddrFromSlice(p[24:40])
-	} else {
-		return 0, fmt.Errorf("invalid WFP response packet")
-	}
-	t.interfaceMu.Lock()
-	addr, ok := t.interfaces[destination]
-	t.interfaceMu.Unlock()
-	if !ok {
-		return 0, fmt.Errorf("WFP response interface not found for %s", destination)
-	}
-	return t.handle.send(p, &addr)
-}
-
 func (t *Tun) selected(info packetInfo, addr address) bool {
 	dst := info.destination.Addr()
 	if !dst.IsGlobalUnicast() || t.excludeIf[addr.IfIdx] || (len(t.includeIf) > 0 && !t.includeIf[addr.IfIdx]) {
@@ -172,7 +148,7 @@ func (t *Tun) capture(info packetInfo) bool {
 		return captured
 	}
 	// Resolve SYNs and UDP packets against current ownership to handle port reuse.
-	entries, err := socketTable(info.flow)
+	entries, err := t.socketTable(info.flow)
 	owner := entries[info.flow]
 	capture := err == nil && owner != 0 && owner != t.pid
 	if info.protocol == 6 {
@@ -195,43 +171,43 @@ func (t *Tun) capture(info packetInfo) bool {
 
 func (t *Tun) readLoop() {
 	defer t.running.Done()
-	p := make([]byte, 65575)
+	p := make([]byte, 65575) // IPv6 header plus its maximum non-jumbo payload.
 	for {
 		var addr address
 		n, err := t.handle.recv(p, &addr)
 		if err != nil {
-			t.close(fmt.Errorf("receive: %w", err))
+			if t.ctx.Err() == nil {
+				t.close(fmt.Errorf("receive: %w", err))
+			}
 			return
 		}
-		info, ok := parsePacket(p[:n])
-		if ok && t.tcp != nil && info.protocol == 6 && info.source.Port() == t.tcp.port(info.source.Addr()) {
-			if t.tcp.reply(p[:n], info) {
-				if _, err = t.Write(p[:n]); err != nil {
-					log.Warnln("[WFP] TCP reply: packet dropped: %s", err)
-				}
+		addr, inject := t.processPacket(p[:n], addr)
+		if inject {
+			if _, err = t.handle.send(p[:n], &addr); err != nil && t.ctx.Err() == nil {
+				log.Warnln("[WFP] inject: packet dropped: %s", err)
 			}
-			// Expired or unsolicited relay connections must not escape to the network.
-			continue
-		}
-		if !ok || !t.selected(info, addr) || !t.capture(info) {
-			if _, err = t.handle.send(p[:n], &addr); err != nil {
-				log.Warnln("[WFP] bypass: packet dropped: %s", err)
-			}
-			continue
-		}
-		t.interfaceMu.Lock()
-		// Replies are inbound on this interface; zero checksum flags request recalculation.
-		t.interfaces[info.source.Addr()] = address{IfIdx: addr.IfIdx, SubIfIdx: addr.SubIfIdx}
-		t.interfaceMu.Unlock()
-		if info.protocol == 6 && t.tcp != nil {
-			t.tcp.redirect(p[:n], info)
-			if _, err = t.Write(p[:n]); err != nil {
-				log.Warnln("[WFP] TCP redirect: packet dropped: %s", err)
-			}
-		} else {
-			t.deliver(p[:n], info)
 		}
 	}
+}
+
+// processPacket returns the address and whether the packet needs reinjection.
+func (t *Tun) processPacket(p []byte, addr address) (address, bool) {
+	info, ok := parsePacket(p)
+	if ok && t.tcp != nil && info.protocol == 6 && info.source.Port() == t.tcp.port(info.source.Addr()) {
+		// Expired or unsolicited relay connections must not escape to the network.
+		return address{IfIdx: addr.IfIdx, SubIfIdx: addr.SubIfIdx}, t.tcp.reply(p, info)
+	}
+	if !ok || !t.selected(info, addr) || !t.capture(info) {
+		return addr, true
+	}
+	// Replies are inbound on this interface; zero checksum flags request recalculation.
+	addr = address{IfIdx: addr.IfIdx, SubIfIdx: addr.SubIfIdx}
+	if info.protocol == 6 && t.tcp != nil {
+		t.tcp.redirect(p, info)
+		return addr, true
+	}
+	t.deliver(p, info, addr)
+	return address{}, false
 }
 
 func (t *Tun) close(err error) {

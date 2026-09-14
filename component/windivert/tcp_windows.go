@@ -102,8 +102,10 @@ func (r *tcpRedirect) accept(t *Tun, listener net.Listener) {
 			return
 		}
 		r.conns[conn] = struct{}{}
+		t.running.Add(1)
 		r.mu.Unlock()
 		go func() {
+			defer t.running.Done()
 			defer func() {
 				conn.Close()
 				r.mu.Lock()

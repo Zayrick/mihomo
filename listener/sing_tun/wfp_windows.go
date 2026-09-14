@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/windivert"
-	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/listener/sing"
 	"golang.org/x/exp/slices"
 )
 
@@ -30,7 +30,7 @@ func (l *Listener) startWFP() error {
 	excludes := append(slices.Clone(options.RouteExcludeAddress), options.Inet4RouteExcludeAddress...)
 	udpTimeout := time.Duration(options.UDPTimeout) * time.Second
 	if udpTimeout <= 0 {
-		udpTimeout = C.DefaultUDPTimeout
+		udpTimeout = sing.UDPTimeout
 	}
 	device, err := windivert.New(windivert.Options{
 		Stack: strings.ToLower(options.Stack.String()), Handler: l.handler, UDPTimeout: udpTimeout,

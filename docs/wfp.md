@@ -27,7 +27,7 @@ go build -tags with_gvisor -o mihomo.exe .
 
 省略 `driver` 时使用默认 TUN 驱动。
 
-WFP 使用 `mtu`（默认 1500）、`dns-hijack`、`udp-timeout`、`route-address`、`route-exclude-address`、`include-interface`、`exclude-interface`、`exclude-src-port` 和 `exclude-dst-port`。每个进程可启用一个 WFP 监听器。
+WFP 使用 `mtu`（默认 1500）、`dns-hijack`、`udp-timeout`（秒，默认 300）、`route-address`、`route-exclude-address`、`include-interface`、`exclude-interface`、`exclude-src-port` 和 `exclude-dst-port`。每个进程可启用一个 WFP 监听器。
 
 `dns-hijack` 需要启用 `dns.enable`，支持普通 TCP/UDP DNS。IPv6 流量由全局 `ipv6` 和 `inet6-address` 控制；DNS 劫持可使用 IPv6 传输。
 

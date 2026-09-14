@@ -111,8 +111,16 @@ func testWFPStack(t *testing.T, stack C.TUNStack, client string) {
 		}
 		conn, err := net.DialTimeout("tcp4", "198.18.0.1:18473", 500*time.Millisecond)
 		if err == nil {
+			conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+			payload := []byte{0}
+			conn.Write(payload)
+			io.ReadFull(conn, payload)
 			conn.Close()
+		}
+		select {
+		case <-echo.seen:
 			t.Fatal("the listener's own connection was intercepted")
+		default:
 		}
 	})
 	t.Run("dns", func(t *testing.T) {
@@ -165,11 +173,21 @@ func TestWFPClient(t *testing.T) {
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatal(err)
 	}
+	if network[:3] == "tcp" {
+		if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	reply := make([]byte, len(payload))
 	if _, err := io.ReadFull(conn, reply); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(reply, payload) {
 		t.Fatalf("incorrect reply: %q", reply)
+	}
+	if network[:3] == "tcp" {
+		if _, err := conn.Read(make([]byte, 1)); err != io.EOF {
+			t.Fatalf("TCP close handshake failed: %v", err)
+		}
 	}
 }
