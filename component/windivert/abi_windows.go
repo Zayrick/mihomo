@@ -48,13 +48,39 @@ func equal(field uint32, value uint32, yes, no uint16) instruction {
 	return instruction{FieldTestSuccess: field | uint32(yes)<<16, Failure: uint32(no), Arg: [4]uint32{value}}
 }
 
-// outbound and !loopback and !impostor and (tcp or udp).
+func equalIPv4(field uint32, ip uint32, yes, no uint16) instruction {
+	// WinDivert represents IPv4 addresses internally as IPv4-mapped IPv6 addresses (::ffff:x.x.x.x).
+	// The driver's filter compiler strictly requires Arg[1] == 0x0000ffff.
+	return instruction{FieldTestSuccess: field | uint32(yes)<<16, Failure: uint32(no), Arg: [4]uint32{ip, 0x0000ffff}}
+}
+
+const (
+	fieldOutbound   = 2
+	fieldTCP        = 8
+	fieldUDP        = 9
+	fieldIPDstAddr  = 22
+	fieldUDPSrcPort = 53
+	fieldUDPDstPort = 54
+	fieldLoopback   = 58
+	fieldImpostor   = 59
+)
+
+// outbound and !loopback and !impostor and (tcp or (udp and !dhcp and !limited_broadcast)).
 var networkFilter = []instruction{
-	equal(2, 1, 1, reject),
-	equal(58, 0, 2, reject),
-	equal(59, 0, 3, reject),
-	equal(8, 1, accept, 4),
-	equal(9, 1, accept, reject),
+	equal(fieldOutbound, 1, 1, reject),
+	equal(fieldLoopback, 0, 2, reject),
+	equal(fieldImpostor, 0, 3, reject),
+	equal(fieldTCP, 1, accept, 4),
+	equal(fieldUDP, 1, 5, reject),
+	equal(fieldUDPSrcPort, 68, reject, 6),
+	equal(fieldUDPDstPort, 67, reject, 7),
+	equal(fieldUDPSrcPort, 67, reject, 8),
+	equal(fieldUDPDstPort, 68, reject, 9),
+	equal(fieldUDPSrcPort, 546, reject, 10),
+	equal(fieldUDPDstPort, 547, reject, 11),
+	equal(fieldUDPSrcPort, 547, reject, 12),
+	equal(fieldUDPDstPort, 546, reject, 13),
+	equalIPv4(fieldIPDstAddr, 0xffffffff, reject, accept),
 }
 
 type handle struct {
